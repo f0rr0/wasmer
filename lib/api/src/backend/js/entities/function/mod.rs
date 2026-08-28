@@ -752,11 +752,6 @@ macro_rules! impl_host_function {
                         let c_struct = unsafe { result.into_c_struct(&mut store) };
                         return c_struct;
                     },
-                    #[cfg(feature = "std")]
-                    #[allow(deprecated)]
-                    Ok(Err(trap)) => crate::backend::js::error::raise(Box::new(trap)),
-                    #[cfg(feature = "core")]
-                    #[allow(deprecated)]
                     Ok(Err(trap)) => crate::backend::js::error::raise(Box::new(trap)),
                     Err(panic) => raise_host_function_panic(panic),
                 }

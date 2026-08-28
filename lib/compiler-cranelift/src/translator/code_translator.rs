@@ -3015,6 +3015,7 @@ pub enum Reachability<T> {
     /// The Wasm execution state has been determined to be statically
     /// unreachable. It is the receiver of this value's responsibility to update
     /// `FuncTranslationState::reachable` as necessary.
+    #[allow(dead_code)]
     Unreachable,
 }
 
@@ -3942,7 +3943,7 @@ fn create_dispatch_block(
 
     builder.switch_to_block(dispatch_block);
     let selector = builder.append_block_param(dispatch_block, TAG_TYPE);
-    let exnref = environ.translate_exn_pointer_to_ref(builder, exn_ptr);
+    let exnref = environ.translate_exn_pointer_to_ref(builder, exn_ptr)?;
 
     let rethrow_block = builder.create_block();
     builder.append_block_param(rethrow_block, EXN_REF_TYPE);

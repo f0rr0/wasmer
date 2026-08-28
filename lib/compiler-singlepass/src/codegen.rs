@@ -1,6 +1,5 @@
 #[cfg(feature = "unwind")]
 use crate::dwarf::WriterRelocate;
-
 use crate::{
     address_map::get_function_address_map,
     codegen_error,
@@ -11,6 +10,7 @@ use crate::{
     machine::{
         AssemblyComment, FinalizedAssembly, Label, Machine, NATIVE_PAGE_SIZE, UnsignedCondition,
     },
+    output_reporter::ChunkedOutputReporter,
     unwind::UnwindFrame,
 };
 #[cfg(feature = "unwind")]
@@ -45,12 +45,15 @@ use wasmer_compiler::{
 #[cfg(feature = "unwind")]
 use wasmer_compiler::types::unwind::CompiledFunctionUnwindInfo;
 
-use wasmer_types::target::{CallingConvention, Target};
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, GlobalIndex, LocalFunctionIndex, MemoryIndex,
-    MemoryStyle, ModuleInfo, SignatureIndex, TableIndex, TableStyle, TrapCode, Type,
-    VMBuiltinFunctionIndex, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, GlobalIndex,
+    LocalFunctionIndex, MemoryIndex, MemoryStyle, ModuleInfo, SignatureIndex, TableIndex,
+    TableStyle, TrapCode, Type, VMBuiltinFunctionIndex, VMOffsets,
     entity::{EntityRef, PrimaryMap},
+};
+use wasmer_types::{
+    target::{CallingConvention, Target},
+    vmctx_offset,
 };
 
 #[allow(type_alias_bounds)]
@@ -145,6 +148,9 @@ pub struct FuncGen<'a, M: Machine> {
 
     /// Assembly comments.
     assembly_comments: HashMap<usize, AssemblyComment>,
+
+    /// Batched function local accounting backed by the module output budget.
+    output_reporter: ChunkedOutputReporter<'a>,
 
     /// DWARF debug information accumulated for this function.
     #[cfg(feature = "unwind")]
@@ -280,6 +286,13 @@ enum NativeCallType {
 const RED_ZONE_SIZE: usize = 32;
 
 impl<'a, M: Machine> FuncGen<'a, M> {
+    /// Charges newly emitted machine code to the function local output batch.
+    #[inline]
+    fn ensure_output_size_within_limit(&mut self) -> Result<(), CompileError> {
+        self.output_reporter
+            .check(self.machine.assembler_get_offset().0)
+    }
+
     /// Acquires location from the machine state.
     ///
     /// If the returned location is used for stack value, `release_location` needs to be called on it;
@@ -308,10 +321,14 @@ impl<'a, M: Machine> FuncGen<'a, M> {
 
     /// Acquire location that will live on the stack.
     fn acquire_location_on_stack(&mut self) -> Result<Location<M::GPR, M::SIMD>, CompileError> {
+        let old_adjust = self.stack_offset.get().next_multiple_of(M::STACK_ALIGNMENT);
         self.stack_offset += 8;
+        let stack_diff = self.stack_offset.get().next_multiple_of(M::STACK_ALIGNMENT) - old_adjust;
+
         let loc = self.machine.local_on_stack(self.stack_offset.get() as i32);
-        self.machine
-            .extend_stack(self.machine.round_stack_adjust(8) as u32)?;
+        if stack_diff > 0 {
+            self.machine.extend_stack(stack_diff as u32)?;
+        }
 
         Ok(loc)
     }
@@ -347,13 +364,18 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         &mut self,
         locs: &[LocationWithCanonicalization<M>],
     ) -> Result<(), CompileError> {
+        let old_adjust = self.stack_offset.get().next_multiple_of(M::STACK_ALIGNMENT);
         for (loc, _) in locs.iter().rev() {
             if let Location::Memory(..) = *loc {
                 self.check_location_on_stack(loc, self.stack_offset.get())?;
                 self.stack_offset -= 8;
-                self.machine
-                    .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
             }
+        }
+        let stack_diff = old_adjust - self.stack_offset.get().next_multiple_of(M::STACK_ALIGNMENT);
+        // It's important to emit a stack release instruction just once as we might be releasing
+        // potentially a big number of slots.
+        if stack_diff > 0 {
+            self.machine.truncate_stack(stack_diff as u32)?;
         }
 
         Ok(())
@@ -364,15 +386,20 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         stack_depth: usize,
     ) -> Result<(), CompileError> {
         let mut stack_offset = self.stack_offset.get();
+        let old_adjust = stack_offset.next_multiple_of(M::STACK_ALIGNMENT);
         let locs = &self.value_stack[stack_depth..];
 
         for (loc, _) in locs.iter().rev() {
             if let Location::Memory(..) = *loc {
                 self.check_location_on_stack(loc, stack_offset)?;
                 stack_offset -= 8;
-                self.machine
-                    .truncate_stack(self.machine.round_stack_adjust(8) as u32)?;
             }
+        }
+        let stack_diff = old_adjust - stack_offset.next_multiple_of(M::STACK_ALIGNMENT);
+        // It's important to emit a stack release instruction just once as we might be releasing
+        // potentially a big number of slots.
+        if stack_diff > 0 {
+            self.machine.truncate_stack(stack_diff as u32)?;
         }
 
         Ok(())
@@ -461,6 +488,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 *loc
             };
             new_params_reversed.push((mapped_loc, *canonicalize));
+            self.ensure_output_size_within_limit()?;
         }
         self.value_stack
             .extend(new_params_reversed.into_iter().rev());
@@ -498,9 +526,6 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         // Callee-saved vmctx.
         static_area_size += 8;
 
-        // Some ABI (like Windows) needs extract reg save
-        static_area_size += 8 * self.machine.list_to_save(calling_convention).len();
-
         // Total size of callee saved registers.
         let callee_saved_regs_size = static_area_size;
 
@@ -513,7 +538,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         static_area_size += num_mem_slots * 8;
 
         // Allocate save area, without actually writing to it.
-        static_area_size = self.machine.round_stack_adjust(static_area_size);
+        static_area_size = static_area_size.next_multiple_of(M::STACK_ALIGNMENT);
 
         // Stack probe.
         //
@@ -524,6 +549,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             .skip(1)
         {
             self.machine.zero_location(Size::S64, locations[i])?;
+            self.ensure_output_size_within_limit()?;
         }
 
         self.machine.extend_stack(static_area_size as _)?;
@@ -543,14 +569,6 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             self.stack_offset.get() as i32,
             Location::GPR(self.machine.get_vmctx_reg()),
         )?;
-
-        // Check if need to same some CallingConvention specific regs
-        let regs_to_save = self.machine.list_to_save(calling_convention);
-        for loc in regs_to_save.iter() {
-            self.stack_offset += 8;
-            self.machine
-                .move_local(self.stack_offset.get() as i32, *loc)?;
-        }
 
         // Save the offset of register save area.
         self.save_area_offset = Some(self.stack_offset.get());
@@ -577,15 +595,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             );
             self.machine
                 .move_location_extend(sz, false, loc, Size::S64, locations[i])?;
+            self.ensure_output_size_within_limit()?;
         }
 
         // Load vmctx into it's GPR.
         self.machine.move_location(
             Size::S64,
-            Location::GPR(
-                self.machine
-                    .get_simple_param_location(0, calling_convention),
-            ),
+            Location::GPR(self.machine.get_simple_param_location(0)),
             Location::GPR(self.machine.get_vmctx_reg()),
         )?;
 
@@ -615,18 +631,10 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         Ok(locations)
     }
 
-    fn finalize_locals(
-        &mut self,
-        calling_convention: CallingConvention,
-    ) -> Result<(), CompileError> {
+    fn finalize_locals(&mut self) -> Result<(), CompileError> {
         // Unwind stack to the "save area".
         self.machine
             .restore_saved_area(self.save_area_offset.unwrap() as i32)?;
-
-        let regs_to_save = self.machine.list_to_save(calling_convention);
-        for loc in regs_to_save.iter().rev() {
-            self.machine.pop_location(*loc)?;
-        }
 
         // Restore register used by vmctx.
         self.machine
@@ -801,20 +809,11 @@ impl<'a, M: Machine> FuncGen<'a, M> {
 
         let calling_convention = self.calling_convention;
 
-        let stack_padding: usize = match calling_convention {
-            CallingConvention::WindowsFastcall => 32,
-            _ => 0,
-        };
-
         let mut stack_offset: usize = 0;
         // Allocate space for return values relative to SP (the allocation happens in reverse order, thus start with return slots).
         let mut return_args = Vec::with_capacity(return_value_sizes.len());
         for i in 0..return_value_sizes.len() {
-            return_args.push(self.machine.get_return_value_location(
-                i,
-                &mut stack_offset,
-                self.calling_convention,
-            ));
+            return_args.push(self.machine.get_return_value_location(i, &mut stack_offset));
         }
 
         // Allocate space for arguments relative to SP.
@@ -832,9 +831,10 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         }
 
         // Align stack to 16 bytes.
-        let stack_unaligned =
-            (self.machine.round_stack_adjust(self.stack_offset.get()) + used_stack + stack_offset)
-                % 16;
+        let stack_unaligned = (self.stack_offset.get().next_multiple_of(M::STACK_ALIGNMENT)
+            + used_stack
+            + stack_offset)
+            % 16;
         if stack_unaligned != 0 {
             stack_offset += 16 - stack_unaligned;
         }
@@ -854,6 +854,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 Location::Memory(_, _) => {
                     self.machine
                         .move_location_for_native(param_sizes[i], *param, loc)?;
+                    self.ensure_output_size_within_limit()?;
                 }
                 _ => {
                     return Err(CompileError::Codegen(
@@ -881,18 +882,12 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             self.machine.move_location(
                 Size::S64,
                 Location::GPR(self.machine.get_vmctx_reg()),
-                Location::GPR(
-                    self.machine
-                        .get_simple_param_location(0, calling_convention),
-                ),
+                Location::GPR(self.machine.get_simple_param_location(0)),
             )?; // vmctx
         }
 
-        if stack_padding > 0 {
-            self.machine.extend_stack(stack_padding as u32)?;
-        }
         self.stack_offset
-            .track_temporary_extra_allocation(stack_offset + stack_padding + used_stack);
+            .track_temporary_extra_allocation(stack_offset + used_stack);
         // release the GPR used for call
         self.machine.release_gpr(self.machine.get_gpr_for_call());
 
@@ -914,12 +909,12 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 return_args[i],
                 return_values[i].0,
             )?;
+            self.ensure_output_size_within_limit()?;
         }
 
         // Restore stack.
-        if stack_offset + stack_padding > 0 {
-            self.machine
-                .truncate_stack((stack_offset + stack_padding) as u32)?;
+        if stack_offset > 0 {
+            self.machine.truncate_stack(stack_offset as u32)?;
         }
 
         // Restore SIMDs.
@@ -950,7 +945,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         cb: F,
     ) -> Result<(), CompileError> {
         let need_check = match self.memory_styles[memory_index] {
-            MemoryStyle::Static { .. } => false,
+            MemoryStyle::Static => false,
             MemoryStyle::Dynamic { .. } => true,
         };
 
@@ -966,7 +961,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             self,
             need_check,
             is_imported,
-            offset as i32,
+            vmctx_offset(offset)?,
             self.special_labels.heap_access_oob,
             self.special_labels.unaligned_atomic,
         )
@@ -998,8 +993,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         // Push return value slots for the function return on the stack.
         self.value_stack.extend((0..return_types.len()).map(|i| {
             (
-                self.machine
-                    .get_call_return_value_location(i, self.calling_convention),
+                self.machine.get_call_return_value_location(i),
                 CanonicalizeType::None,
             )
         }));
@@ -1033,6 +1027,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         local_types_excluding_arguments: &[WpType],
         machine: M,
         calling_convention: CallingConvention,
+        progress_callback: Option<&'a CompilationProgressCallback>,
     ) -> Result<FuncGen<'a, M>, CompileError> {
         let func_index = module.func_index(local_func_index);
         let sig_index = module.functions[func_index];
@@ -1085,6 +1080,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             .ok(),
             function_name,
             assembly_comments: HashMap::new(),
+            output_reporter: ChunkedOutputReporter::new(progress_callback),
         };
         fg.emit_head()?;
         Ok(fg)
@@ -1104,23 +1100,24 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         value_stack_depth_after: usize,
         return_values: usize,
     ) -> Result<(), CompileError> {
-        for (i, (stack_value, canonicalize)) in self
+        let return_values: SmallVec<[LocationWithCanonicalization<M>; 8]> = self
             .value_stack
             .iter()
             .rev()
             .take(return_values)
-            .enumerate()
-        {
+            .copied()
+            .collect();
+        for (i, (stack_value, canonicalize)) in return_values.into_iter().enumerate() {
             let dst = self.value_stack[value_stack_depth_after - i - 1].0;
             if let Some(canonicalize_size) = canonicalize.to_size()
                 && self.config.enable_nan_canonicalization
             {
                 self.machine
-                    .canonicalize_nan(canonicalize_size, *stack_value, dst)?;
+                    .canonicalize_nan(canonicalize_size, stack_value, dst)?;
             } else {
-                self.machine
-                    .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
+                self.machine.emit_relaxed_mov(Size::S64, stack_value, dst)?;
             }
+            self.ensure_output_size_within_limit()?;
         }
 
         Ok(())
@@ -1133,17 +1130,18 @@ impl<'a, M: Machine> FuncGen<'a, M> {
         value_stack_depth_after: usize,
         param_count: usize,
     ) -> Result<(), CompileError> {
-        for (i, (stack_value, _)) in self
+        let params: SmallVec<[LocationWithCanonicalization<M>; 8]> = self
             .value_stack
             .iter()
             .rev()
             .take(param_count)
             .rev()
-            .enumerate()
-        {
+            .copied()
+            .collect();
+        for (i, (stack_value, _)) in params.into_iter().enumerate() {
             let dst = self.value_stack[value_stack_depth_after + i].0;
-            self.machine
-                .emit_relaxed_mov(Size::S64, *stack_value, dst)?;
+            self.machine.emit_relaxed_mov(Size::S64, stack_value, dst)?;
+            self.ensure_output_size_within_limit()?;
         }
 
         Ok(())
@@ -1219,7 +1217,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 {
                     let offset = self.vmoffsets.vmctx_vmglobal_definition(local_global_index);
                     (
-                        Location::Memory(self.machine.get_vmctx_reg(), offset as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset(offset)?),
                         None,
                     )
                 } else {
@@ -1230,7 +1228,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         .vmctx_vmglobal_import_definition(global_index);
                     self.machine.emit_relaxed_mov(
                         Size::S64,
-                        Location::Memory(self.machine.get_vmctx_reg(), offset as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset(offset)?),
                         Location::GPR(tmp),
                     )?;
                     (Location::Memory(tmp, 0), Some(tmp))
@@ -1249,7 +1247,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 {
                     let offset = self.vmoffsets.vmctx_vmglobal_definition(local_global_index);
                     (
-                        Location::Memory(self.machine.get_vmctx_reg(), offset as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset(offset)?),
                         None,
                     )
                 } else {
@@ -1260,7 +1258,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         .vmctx_vmglobal_import_definition(global_index);
                     self.machine.emit_relaxed_mov(
                         Size::S64,
-                        Location::Memory(self.machine.get_vmctx_reg(), offset as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset(offset)?),
                         Location::GPR(tmp),
                     )?;
                     (Location::Memory(tmp, 0), Some(tmp))
@@ -2326,16 +2324,12 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         function_index - self.module.num_imported_functions,
                     ))
                 };
-                let calling_convention = self.calling_convention;
-
                 self.emit_call_native(
                     |this| {
                         let offset = this
                             .machine
                             .mark_instruction_with_trap_code(TrapCode::StackOverflow);
-                        let mut relocations = this
-                            .machine
-                            .emit_call_with_reloc(calling_convention, reloc_target)?;
+                        let mut relocations = this.machine.emit_call_with_reloc(reloc_target)?;
                         this.machine.mark_instruction_address_end(offset);
                         this.relocations.append(&mut relocations);
                         Ok(())
@@ -2412,18 +2406,20 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     )?;
                 } else if let Some(local_table_index) = self.module.local_table_index(table_index) {
                     let (vmctx_offset_base, vmctx_offset_len) = (
-                        self.vmoffsets.vmctx_vmtable_definition(local_table_index),
-                        self.vmoffsets
-                            .vmctx_vmtable_definition_current_elements(local_table_index),
+                        vmctx_offset(self.vmoffsets.vmctx_vmtable_definition(local_table_index))?,
+                        vmctx_offset(
+                            self.vmoffsets
+                                .vmctx_vmtable_definition_current_elements(local_table_index),
+                        )?,
                     );
                     self.machine.move_location(
                         Size::S64,
-                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset_base as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset_base),
                         Location::GPR(table_base),
                     )?;
                     self.machine.move_location(
                         Size::S32,
-                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset_len as i32),
+                        Location::Memory(self.machine.get_vmctx_reg(), vmctx_offset_len),
                         Location::GPR(table_count),
                     )?;
                 } else {
@@ -2431,7 +2427,10 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     let import_offset = self.vmoffsets.vmctx_vmtable_import(table_index);
                     self.machine.move_location(
                         Size::S64,
-                        Location::Memory(self.machine.get_vmctx_reg(), import_offset as i32),
+                        Location::Memory(
+                            self.machine.get_vmctx_reg(),
+                            vmctx_offset(import_offset)?,
+                        ),
                         Location::GPR(table_base),
                     )?;
 
@@ -2465,9 +2464,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 self.machine.emit_imul_imm32(
                     Size::S64,
                     if local_fixed_funcref_table.is_some() {
-                        self.vmoffsets.size_of_vmcaller_checked_anyfunc() as u32
+                        u32::from(self.vmoffsets.size_of_vmcaller_checked_anyfunc())
                     } else {
-                        self.vmoffsets.size_of_vm_funcref() as u32
+                        u32::from(self.vmoffsets.size_of_vm_funcref())
                     },
                     table_count,
                 )?;
@@ -2483,7 +2482,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         Size::S64,
                         Location::Memory(
                             table_count,
-                            self.vmoffsets.vmcaller_checked_anyfunc_func_ptr() as i32,
+                            i32::from(self.vmoffsets.vmcaller_checked_anyfunc_func_ptr()),
                         ),
                         Location::GPR(table_base),
                     )?;
@@ -2500,7 +2499,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         Size::S64,
                         Location::Memory(
                             table_count,
-                            self.vmoffsets.vm_funcref_anyfunc_ptr() as i32,
+                            i32::from(self.vmoffsets.vm_funcref_anyfunc_ptr()),
                         ),
                         Location::GPR(table_count),
                     )?;
@@ -2526,7 +2525,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Location::GPR(sig_hash),
                     Location::Memory(
                         table_count,
-                        (self.vmoffsets.vmcaller_checked_anyfunc_signature_hash() as usize) as i32,
+                        i32::from(self.vmoffsets.vmcaller_checked_anyfunc_signature_hash()),
                     ),
                     self.special_labels.bad_signature,
                 )?;
@@ -2544,10 +2543,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 }
 
                 let vmcaller_checked_anyfunc_func_ptr =
-                    self.vmoffsets.vmcaller_checked_anyfunc_func_ptr() as usize;
+                    i32::from(self.vmoffsets.vmcaller_checked_anyfunc_func_ptr());
                 let vmcaller_checked_anyfunc_vmctx =
-                    self.vmoffsets.vmcaller_checked_anyfunc_vmctx() as usize;
-                let calling_convention = self.calling_convention;
+                    i32::from(self.vmoffsets.vmcaller_checked_anyfunc_vmctx());
 
                 self.emit_call_native(
                     |this| {
@@ -2558,16 +2556,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                         // We set the context pointer
                         this.machine.move_location(
                             Size::S64,
-                            Location::Memory(gpr_for_call, vmcaller_checked_anyfunc_vmctx as i32),
-                            Location::GPR(
-                                this.machine
-                                    .get_simple_param_location(0, calling_convention),
-                            ),
+                            Location::Memory(gpr_for_call, vmcaller_checked_anyfunc_vmctx),
+                            Location::GPR(this.machine.get_simple_param_location(0)),
                         )?;
 
                         this.machine.emit_call_location(Location::Memory(
                             gpr_for_call,
-                            vmcaller_checked_anyfunc_func_ptr as i32,
+                            vmcaller_checked_anyfunc_func_ptr,
                         ))?;
                         this.machine.mark_instruction_address_end(offset);
                         Ok(())
@@ -2789,12 +2784,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(if local_memory_index.is_some() {
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            if local_memory_index.is_some() {
                                 VMBuiltinFunctionIndex::get_memory32_size_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_memory32_size_index()
-                            }) as i32,
+                            },
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -2819,9 +2815,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_memory_init_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_memory_init_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -2859,9 +2855,11 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_data_drop_index())
-                            as i32,
+                        vmctx_offset(
+                            self.vmoffsets.vmctx_builtin_function(
+                                VMBuiltinFunctionIndex::get_data_drop_index(),
+                            ),
+                        )?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -2887,9 +2885,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_memory_copy_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_memory_copy_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -2945,7 +2943,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(memory_fill_index) as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(memory_fill_index))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -2982,12 +2980,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(if local_memory_index.is_some() {
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            if local_memory_index.is_some() {
                                 VMBuiltinFunctionIndex::get_memory32_grow_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_memory32_grow_index()
-                            }) as i32,
+                            },
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -3585,9 +3584,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_raise_trap_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_raise_trap_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -3727,6 +3726,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     let label = frame.label;
                     self.release_stack_locations_keep_stack_offset(stack_depth)?;
                     self.machine.jmp_unconditional(label)?;
+                    self.ensure_output_size_within_limit()?;
                 }
                 self.machine.emit_label(default_br)?;
 
@@ -3756,6 +3756,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                 self.machine.emit_label(table_label)?;
                 for x in table {
                     self.machine.jmp_unconditional(x)?;
+                    self.ensure_output_size_within_limit()?;
                 }
                 self.unreachable_depth = 1;
             }
@@ -3774,7 +3775,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
 
                 if self.control_stack.is_empty() {
                     self.machine.emit_label(frame.label)?;
-                    self.finalize_locals(self.calling_convention)?;
+                    self.finalize_locals()?;
                     self.machine.emit_function_epilog()?;
 
                     // Make a copy of the return value in XMM0, as required by the SysV CC.
@@ -5501,9 +5502,11 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_func_ref_index())
-                            as i32,
+                        vmctx_offset(
+                            self.vmoffsets.vmctx_builtin_function(
+                                VMBuiltinFunctionIndex::get_func_ref_index(),
+                            ),
+                        )?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5542,13 +5545,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
                             if self.module.local_table_index(table_index).is_some() {
                                 VMBuiltinFunctionIndex::get_table_set_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_table_set_index()
                             },
-                        ) as i32,
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5586,13 +5589,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
                             if self.module.local_table_index(table_index).is_some() {
                                 VMBuiltinFunctionIndex::get_table_get_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_table_get_index()
                             },
-                        ) as i32,
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5628,13 +5631,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
                             if self.module.local_table_index(table_index).is_some() {
                                 VMBuiltinFunctionIndex::get_table_size_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_table_size_index()
                             },
-                        ) as i32,
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5667,13 +5670,13 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
                             if self.module.local_table_index(table_index).is_some() {
                                 VMBuiltinFunctionIndex::get_table_grow_index()
                             } else {
                                 VMBuiltinFunctionIndex::get_imported_table_grow_index()
                             },
-                        ) as i32,
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5711,9 +5714,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_table_copy_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_table_copy_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5756,9 +5759,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_table_fill_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_table_fill_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5793,9 +5796,9 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_table_init_index())
-                            as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(
+                            VMBuiltinFunctionIndex::get_table_init_index(),
+                        ))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5833,9 +5836,11 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets
-                            .vmctx_builtin_function(VMBuiltinFunctionIndex::get_elem_drop_index())
-                            as i32,
+                        vmctx_offset(
+                            self.vmoffsets.vmctx_builtin_function(
+                                VMBuiltinFunctionIndex::get_elem_drop_index(),
+                            ),
+                        )?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5876,7 +5881,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(memory_atomic_wait32) as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(memory_atomic_wait32))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5926,7 +5931,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(memory_atomic_wait64) as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(memory_atomic_wait64))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -5975,7 +5980,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     Size::S64,
                     Location::Memory(
                         self.machine.get_vmctx_reg(),
-                        self.vmoffsets.vmctx_builtin_function(memory_atomic_notify) as i32,
+                        vmctx_offset(self.vmoffsets.vmctx_builtin_function(memory_atomic_notify))?,
                     ),
                     Location::GPR(self.machine.get_gpr_for_call()),
                 )?;
@@ -6005,7 +6010,7 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             }
         }
 
-        Ok(())
+        self.ensure_output_size_within_limit()
     }
 
     fn add_assembly_comment(&mut self, comment: AssemblyComment) {
@@ -6084,12 +6089,6 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     unwind_info = Some(CompiledFunctionUnwindInfo::Dwarf);
                 }
             }
-            CallingConvention::WindowsFastcall => {
-                let unwind = self.machine.gen_windows_unwind_info(body_len);
-                if let Some(unwind) = unwind {
-                    unwind_info = Some(CompiledFunctionUnwindInfo::WindowsX64(unwind));
-                }
-            }
             _ => (),
         };
 
@@ -6111,6 +6110,8 @@ impl<'a, M: Machine> FuncGen<'a, M> {
             assembly_comments,
         } = self.machine.assembler_finalize(self.assembly_comments)?;
         body.shrink_to_fit();
+
+        self.output_reporter.finish(body.len())?;
 
         if let Some(callbacks) = self.config.callbacks.as_ref() {
             callbacks.obj_memory_buffer(

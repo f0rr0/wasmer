@@ -68,7 +68,7 @@ impl Engine {
         features: Features,
     ) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let tunables = BaseTunables::for_target(&target);
+        let tunables = BaseTunables::new();
         let compiler = compiler_config.compiler();
         let name = format!("engine-{}", compiler.name());
         Self {
@@ -113,6 +113,20 @@ impl Engine {
         }
     }
 
+    /// Returns the format used for artifacts produced by this engine.
+    pub fn artifact_format(&self) -> String {
+        #[cfg(feature = "compiler")]
+        {
+            let i = self.inner();
+            if let Some(ref c) = i.compiler {
+                return c.artifact_format();
+            }
+        }
+
+        #[allow(unreachable_code)]
+        self.name.to_string()
+    }
+
     /// Create a headless `Engine`
     ///
     /// A headless engine is an engine without any compiler attached.
@@ -129,7 +143,7 @@ impl Engine {
     pub fn headless() -> Self {
         let target = Target::default();
         #[cfg(not(target_arch = "wasm32"))]
-        let tunables = BaseTunables::for_target(&target);
+        let tunables = BaseTunables::new();
         Self {
             inner: Arc::new(Mutex::new(EngineInner {
                 #[cfg(feature = "compiler")]

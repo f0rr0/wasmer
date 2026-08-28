@@ -20,6 +20,7 @@ use crate::unwind::create_systemv_cie;
 use enumset::EnumSet;
 #[cfg(feature = "unwind")]
 use gimli::write::{EhFrame, FrameTable, Writer};
+use itertools::Itertools;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,7 +87,6 @@ impl SinglepassCompiler {
         };
 
         let calling_convention = match target.triple().default_calling_convention() {
-            Ok(CallingConvention::WindowsFastcall) => CallingConvention::WindowsFastcall,
             Ok(CallingConvention::SystemV) => CallingConvention::SystemV,
             Ok(CallingConvention::AppleAarch64) => CallingConvention::AppleAarch64,
             _ => match target.triple().architecture {
@@ -157,6 +157,7 @@ impl SinglepassCompiler {
                     target,
                     calling_convention,
                     self.config.experimental_artifact,
+                    progress_callback,
                 )
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
@@ -196,6 +197,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -217,6 +219,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -241,6 +244,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -282,6 +286,7 @@ impl SinglepassCompiler {
                         target,
                         calling_convention,
                         self.config.experimental_artifact.then_some(&kind),
+                        progress_callback,
                     )?;
                     if let Some(callbacks) = self.config.callbacks.as_ref()
                         && let CompileOutput::InMemory(body) = &body
@@ -321,6 +326,7 @@ impl SinglepassCompiler {
                         target,
                         calling_convention,
                         self.config.experimental_artifact.then_some(&kind),
+                        progress_callback,
                     )?;
                     if let Some(callbacks) = self.config.callbacks.as_ref()
                         && let CompileOutput::InMemory(body) = &body
@@ -394,6 +400,9 @@ impl SinglepassCompiler {
             eh_frame.write(&[0, 0, 0, 0]).unwrap(); // Write a 0 length at the end of the table.
 
             let eh_frame_section = eh_frame.0.into_section();
+            if let Some(progress_callback) = progress_callback.as_ref() {
+                progress_callback.reserve_size(eh_frame_section.bytes.len())?;
+            }
             custom_sections.push(eh_frame_section);
             unwind_info.eh_frame = Some(SectionIndex::new(custom_sections.len() - 1))
         };
@@ -424,11 +433,30 @@ impl Compiler for SinglepassCompiler {
     }
 
     fn deterministic_id(&self) -> String {
-        if self.config.experimental_artifact {
-            String::from("singlepass-elf")
-        } else {
-            String::from("singlepass")
+        use wasmer_compiler::DeterministicIdComponent as Component;
+
+        let mut components = vec![Component::Singlepass];
+        if self.config.enable_nan_canonicalization {
+            components.push(Component::NanCanonicalization);
         }
+        if self.config.allow_experimental_unaligned_memory_accesses {
+            components.push(Component::ExperimentalUnalignedMemoryAccesses);
+        }
+
+        components
+            .into_iter()
+            .map(|component| component.to_string())
+            .collect_vec()
+            .join("-")
+    }
+
+    fn artifact_format(&self) -> String {
+        if self.config.experimental_artifact {
+            wasmer_compiler::ArtifactFormat::Native
+        } else {
+            wasmer_compiler::ArtifactFormat::Rkyv
+        }
+        .to_string()
     }
 
     /// Get the middlewares for this compiler

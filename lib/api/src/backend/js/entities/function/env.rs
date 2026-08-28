@@ -9,7 +9,6 @@ use crate::{
     js::{store::StoreHandle, vm::VMFunctionEnvironment},
     store::{AsStoreMut, AsStoreRef, StoreRef},
 };
-#[cfg(feature = "experimental-async")]
 use wasmer_types::StoreId;
 
 #[derive(Debug)]
@@ -157,7 +156,6 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
     pub fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
         self.store_mut.as_store_async()
     }
-
     #[cfg(feature = "experimental-async")]
     pub fn as_async_mut(&self) -> Option<AsyncFunctionEnvMut<T>> {
         let store = StoreAsync::from_context(self.store_mut.as_store_ref().objects().id())?;

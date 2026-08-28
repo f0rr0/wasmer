@@ -946,6 +946,9 @@ lint-package-crate:
 lint-formatting:
 	cargo fmt --all -- --check
 	cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+	# The wasm_tests Rust fixtures are not part of any crate, so `cargo fmt`
+	# does not cover them.
+	cd lib/wasix/tests/wasm_tests && find . -path ./build -prune -o -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
 lint: lint-yamlfmt lint-clang-format lint-formatting lint-packages lint-taplo
 
@@ -962,7 +965,7 @@ update-graphql-schema:
 	curl -sSfL https://registry.wapm.io/graphql/schema.graphql > lib/registry/graphql/schema.graphql
 
 require-nextest:
-	cargo nextest --version > /dev/null || cargo binstall cargo-nextest --secure || cargo install cargo-nextest
+	cargo nextest --version > /dev/null || cargo binstall cargo-nextest --secure || cargo install cargo-nextest --locked
 
 # Check all the features compatible with the `sys` backend.
 check-api-features:

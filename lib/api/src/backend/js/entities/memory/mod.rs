@@ -49,7 +49,6 @@ impl Memory {
     pub fn js_buffer(&self) -> wasm_bindgen::JsValue {
         self.handle.memory.buffer()
     }
-
     pub fn new(store: &mut impl AsStoreMut, mut ty: MemoryType) -> Result<Self, MemoryError> {
         if ty.shared
             && let Some(maximum) = ty.maximum

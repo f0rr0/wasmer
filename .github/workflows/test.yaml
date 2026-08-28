@@ -43,6 +43,18 @@ jobs:
           echo "DOING_RELEASE=${DOING_RELEASE}" >> $GITHUB_OUTPUT
           echo $VERSION
           echo $DOING_RELEASE
+  dependency_cooldown:
+    name: Dependency cooldown
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Check for eligible dependency updates
+        run: cargo +nightly update
   lint:
     name: Code lint
     runs-on: ubuntu-24.04
@@ -69,9 +81,8 @@ jobs:
       - run: go install github.com/google/yamlfmt/cmd/yamlfmt@v0.21.0
       - name: Install LLVM (Linux)
         run: |
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz -L -o /opt/llvm.tar.xz
           mkdir -p /opt/llvm-22
-          tar xf /opt/llvm.tar.xz --strip-components=1 -C /opt/llvm-22
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst -L -o - | tar --zstd -xf - --strip-components=1 -C /opt/llvm-22
           echo '/opt/llvm-22/bin' >> $GITHUB_PATH
           echo 'LLVM_SYS_221_PREFIX=/opt/llvm-22' >> $GITHUB_ENV
       - name: Install taplo
@@ -111,6 +122,18 @@ jobs:
           newest=$(printf '%s\n' "$latest" "$WASIX_LIBC_SYSROOT_TAG" | sort -V | tail -1)
           if [ "$WASIX_LIBC_SYSROOT_TAG" != "$newest" ]; then
             echo "Pinned sysroot ($WASIX_LIBC_SYSROOT_TAG) is older than latest release ($latest)"
+            exit 1
+          fi
+      - name: Verify pinned wasix rust toolchain is up to date
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source .github/ci-constants.env
+          latest=$(gh release list --exclude-pre-releases --order desc -R wasix-org/rust --json tagName -q '.[0].tagName')
+          newest=$(printf '%s\n' "$latest" "$WASIX_RUST_TOOLCHAIN_TAG" | sort -V | tail -1)
+          if [ "$WASIX_RUST_TOOLCHAIN_TAG" != "$newest" ]; then
+            echo "Pinned rust toolchain ($WASIX_RUST_TOOLCHAIN_TAG) is older than latest release ($latest)"
             exit 1
           fi
   cargo_deny:
@@ -247,10 +270,9 @@ jobs:
           sudo apt-get install ninja-build -y
       - name: Install LLVM 22
         run: |
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz -L -o llvm.tar.xz
           LLVM_DIR=$(pwd)/${{ env.LLVM_DIR }}
           mkdir ${LLVM_DIR}
-          tar xf llvm.tar.xz --strip-components=1 -C ${LLVM_DIR}
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst -L -o - | tar --zstd -xf - --strip-components=1 -C ${LLVM_DIR}
           echo "ENABLE_LLVM=1" >> $GITHUB_ENV
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           echo "${LLVM_DIR}/usr/bin" >> $GITHUB_PATH
@@ -348,7 +370,7 @@ jobs:
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz"
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst"
             # Unfortunately, building a shared lib of the c_api with the V8
             # backend does not work, due to unsupported relocations to hidden
             # symbols in wee8.
@@ -357,19 +379,19 @@ jobs:
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-aarch64.tar.xz"
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-aarch64.tar.zst"
             supports_v8: false
           - build: macos-arm
             os: depot-macos-14
             target: aarch64-apple-darwin
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-darwin-aarch64.tar.xz"
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-darwin-aarch64.tar.zst"
             supports_v8: true
           - build: windows-x64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             exe: ".exe"
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-windows-amd64.tar.xz"
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-windows-amd64.tar.zst"
             supports_v8: false
           - build: windows-gnu
             target: x86_64-pc-windows-gnu
@@ -474,10 +496,9 @@ jobs:
         shell: bash
         if: matrix.metadata.llvm_url
         run: |
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf ${{ matrix.metadata.llvm_url }} -L -o llvm.tar.xz
           LLVM_DIR=$(pwd)/${{ env.LLVM_DIR }}
           mkdir ${LLVM_DIR}
-          tar xf llvm.tar.xz --strip-components=1 -C ${LLVM_DIR}
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf "${{ matrix.metadata.llvm_url }}" -L -o - | tar --zstd -xf - --strip-components=1 -C ${LLVM_DIR}
           echo "ENABLE_LLVM=1" >> $GITHUB_ENV
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           echo "${LLVM_DIR}/usr/bin" >> $GITHUB_PATH
@@ -596,26 +617,32 @@ jobs:
           - description: "CLI integ. tests"
             make: test-integration-cli-ci
         metadata:
+          # `wasix_rust_toolchain` marks the hosts wasix-org/rust publishes a
+          # toolchain for, i.e. the ones that collect the Rust wasm_tests
+          # fixtures (see lib/wasix/tests/wasm_tests/README.md).
           - build: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz"
+            wasix_rust_toolchain: true
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.zst"
           - build: linux-arm64
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-aarch64.tar.xz"
+            wasix_rust_toolchain: true
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-aarch64.tar.zst"
           - build: macos-arm
             os: depot-macos-14
             target: aarch64-apple-darwin
             exe: ""
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-darwin-aarch64.tar.xz"
+            wasix_rust_toolchain: true
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-darwin-aarch64.tar.zst"
           - build: windows-x64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             exe: ".exe"
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-windows-amd64.tar.xz"
+            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-windows-amd64.tar.zst"
           - build: linux-musl
             target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
@@ -696,6 +723,8 @@ jobs:
         with:
           toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
           target: ${{ matrix.metadata.target }}
+      # For the wasip1-toolchain variants of the Rust wasm_tests fixtures, which
+      # build on every platform we support.
       - name: Install Rust WASI targets
         if: matrix.stage.make == 'test-all'
         shell: bash
@@ -716,14 +745,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: WASIXCC_SYSROOT_PREFIX=~/.wasixcc/sysroot-v2026-05-12.1 wasixccenv download-sysroot v2026-05-12.1
         if: matrix.metadata.build != 'windows-x64'
+      # For the wasix-toolchain variants of the Rust wasm_tests fixtures.
+      - name: Install cargo-wasix
+        if: matrix.stage.make == 'test-all' && matrix.metadata.wasix_rust_toolchain
+        uses: wasix-org/cargo-wasix@main
+        with:
+          toolchain-version: ${{ env.WASIX_RUST_TOOLCHAIN_TAG }}
       - name: Install LLVM
         shell: bash
         if: matrix.metadata.llvm_url
         run: |
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf ${{ matrix.metadata.llvm_url }} -L -o llvm.tar.xz
           LLVM_DIR=$(pwd)/${{ env.LLVM_DIR }}
           mkdir ${LLVM_DIR}
-          tar xf llvm.tar.xz --strip-components=1 -C ${LLVM_DIR}
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf "${{ matrix.metadata.llvm_url }}" -L -o - | tar --zstd -xf - --strip-components=1 -C ${LLVM_DIR}
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           echo "${LLVM_DIR}/usr/bin" >> $GITHUB_PATH
           echo "LLVM_SYS_221_PREFIX=${LLVM_DIR}" >> $GITHUB_ENV
